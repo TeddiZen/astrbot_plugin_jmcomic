@@ -1,0 +1,9 @@
+name: astrbot_plugin_jmcomic
+display_name: JMComic PDF
+desc: 下载漫画并发送 PDF 或临时下载链接，可配置群聊和使用权限。
+version: v2.2.0
+author: Air
+repo: https://github.com/air041001/astrbot_plugin_jmcomic
+astrbot_version: ">=4.0.0"
+support_platforms:
+  - aiocqhttp

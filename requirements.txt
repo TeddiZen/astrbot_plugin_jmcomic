@@ -1,3 +1,4 @@
 jmcomic
 Pillow
 requests
+img2pdf

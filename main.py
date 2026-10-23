@@ -1,96 +1,198 @@
-import os
-import shutil
 import asyncio
-import requests 
-from astrbot.api.all import *
+import os
+import re
+import tempfile
+from pathlib import Path
+from urllib.parse import urlsplit, urlunsplit
+
+import img2pdf
 import jmcomic
+import requests
 from PIL import Image
 
-@register("jmcomic_pdf", "Air", "私聊专属 JM PDF 直传", "1.0.0")
+from astrbot.api import AstrBotConfig, logger
+from astrbot.api.event import AstrMessageEvent, filter
+from astrbot.api.message_components import File
+from astrbot.api.star import Context, Star, register
+
+
+@register("astrbot_plugin_jmcomic", "Air", "下载漫画并发送 PDF 或临时下载链接", "2.2.0")
 class JMComicPDFPlugin(Star):
-    def __init__(self, context: Context):
+    def __init__(self, context: Context, config: AstrBotConfig):
         super().__init__(context)
-        self.base_mount_dir = "/AstrBot/data/jm_tmp"
-        if not os.path.exists(self.base_mount_dir):
-            os.makedirs(self.base_mount_dir, exist_ok=True)
-            os.chmod(self.base_mount_dir, 0o777)
+        self.config = config
+        self.base_mount_dir = Path(__file__).resolve().parents[2] / "jm_tmp"
+        self.base_mount_dir.mkdir(parents=True, exist_ok=True)
+        self._download_lock = asyncio.Lock()
 
-    @command("jm")
-    async def fetch_comic(self, event: AstrMessageEvent, comic_id: str):
-    # =================【安全护盾：白名单机制】=================
-        # 将允许使用的 QQ 号写在这里，用英文双引号括起来，逗号隔开
-        WHITELIST = ["朋友的QQ号1", "朋友的QQ号2"]
-        
-        # 获取发指令的人的 ID
-        sender_id = event.get_sender_id()
-        
-        # 如果发消息的人不在白名单里
-        if not any(qq in sender_id for qq in WHITELIST):
-            # 强烈建议直接 return 装死！在陌生人眼里，它就是一个死号，根本不会引起注意。
-            return
-        if not comic_id.isdigit():
-            yield event.plain_result("❌ 主人，ID 必须是纯数字。")
+    @filter.command("jm")
+    async def fetch_comic(self, event: AstrMessageEvent, comic_id: str = ""):
+        """下载指定 ID 的漫画，按插件配置发送 PDF 或下载链接。"""
+        event.stop_event()
+        if event.get_group_id() and not self.config.get("allow_group", False):
+            yield event.plain_result("当前未开放群聊使用，请私聊机器人。")
             return
 
-        yield event.plain_result(f"⏳ 收到！开始为您下载 ID: {comic_id}...")
+        access_mode = self.config.get("access_mode", "仅管理员")
+        if access_mode not in ("仅管理员", "所有人"):
+            yield event.plain_result("使用权限配置无效，请管理员检查插件配置。")
+            return
+        if access_mode == "仅管理员" and not event.is_admin():
+            yield event.plain_result("当前仅允许 AstrBot 管理员使用此指令。")
+            return
 
-        work_dir = os.path.join(self.base_mount_dir, comic_id)
-        if os.path.exists(work_dir):
-            shutil.rmtree(work_dir, ignore_errors=True)
-        os.makedirs(work_dir, exist_ok=True)
-        os.chmod(work_dir, 0o777)
+        if not re.fullmatch(r"[0-9]+", comic_id):
+            yield event.plain_result("用法：/jm 漫画ID，ID 必须是纯数字。")
+            return
 
-        try:
-            option = jmcomic.JmOption.default()
-            option.dir_rule.base_dir = work_dir
-            await asyncio.to_thread(jmcomic.download_album, comic_id, option)
+        delivery_mode = self.config.get("delivery_mode", "下载链接")
+        if delivery_mode not in ("下载链接", "直接发送 PDF"):
+            yield event.plain_result("发送方式配置无效，请管理员检查插件配置。")
+            return
 
-            images = []
-            pdf_name = f"{comic_id}.pdf"
-            pdf_path = os.path.join(work_dir, pdf_name)
-            
-            for root, dirs, files in os.walk(work_dir):
-                valid_files = [f for f in files if f.lower().endswith(('.webp', '.jpg', '.jpeg', '.png'))]
-                if valid_files:
-                    valid_files.sort() 
-                    for file in valid_files:
-                        img_path = os.path.join(root, file)
-                        try:
-                            img = Image.open(img_path).convert('RGB')
-                            images.append(img)
-                        except: pass
-                    break
+        if self._download_lock.locked():
+            yield event.plain_result("当前正在处理其他请求，请稍后重试。")
+            return
 
-            if images:
-                images[0].save(pdf_path, "PDF", resolution=100.0, save_all=True, append_images=images[1:])
-
-            if os.path.exists(pdf_path):
-                yield event.plain_result("✅ PDF 缝合完毕，正在打包送往云端...")
-                
-                # 上传到完全匿名、免费的临时文件云端
-                def upload_to_tmpfiles():
-                    url = "https://tmpfiles.org/api/v1/upload"
-                    with open(pdf_path, 'rb') as f:
-                        response = requests.post(url, files={'file': f})
-                    return response.json()
-
-                upload_res = await asyncio.to_thread(upload_to_tmpfiles)
-                
-                if upload_res.get("status") == "success":
-                    raw_url = upload_res["data"]["url"]
-                    direct_url = raw_url.replace("tmpfiles.org/", "tmpfiles.org/dl/")
-                    # 比如把点替换掉
-                    safe_url = direct_url.replace(".", "。").replace("http://", "")
-                    msg = f"请复制这段文字到浏览器，把句号改成点即可下载：\n{safe_url}"
-                    
-                    yield event.plain_result(msg)
+        async with self._download_lock:
+            try:
+                pdf_path = self._find_cached_pdf(comic_id)
+                if pdf_path is None:
+                    yield event.plain_result(f"正在下载 {comic_id} 并生成 PDF，请稍候。")
+                    pdf_path = await asyncio.to_thread(self._download_pdf, comic_id)
                 else:
-                    yield event.plain_result("❌ 云端中转失败，请检查网络代理。")
-                
-                # 发送完毕，销毁本地证据
-                shutil.rmtree(work_dir, ignore_errors=True)
-            else:
-                yield event.plain_result("❌ 逻辑走通了，但没找到生成的 PDF。")
+                    yield event.plain_result("找到已生成的 PDF，正在发送。")
 
-        except Exception as e:
-            yield event.plain_result(f"❌ 运行报错: {str(e)}")
+                if delivery_mode == "直接发送 PDF":
+                    if event.get_platform_name() == "aiocqhttp":
+                        await self._send_onebot_pdf(event, pdf_path)
+                        yield event.plain_result("PDF 已发送。")
+                    else:
+                        yield event.chain_result(
+                            [File(name=pdf_path.name, file=str(pdf_path))]
+                        )
+                else:
+                    yield event.plain_result("正在上传 PDF 并获取临时下载链接。")
+                    download_url = await asyncio.to_thread(self._upload_pdf, pdf_path)
+                    yield event.plain_result(f"下载地址：\n{download_url}")
+            except Exception:
+                logger.exception("JMComic 请求处理失败，漫画 ID：%s", comic_id)
+                yield event.plain_result("处理失败，请管理员查看 AstrBot 日志。")
+
+    @staticmethod
+    async def _send_onebot_pdf(event: AstrMessageEvent, pdf_path: Path) -> None:
+        # LLoneBot 和 NapCat 共同支持的文件接口，避免依赖普通消息的 file 扩展。
+        group_id = event.get_group_id()
+        target_key = "group_id" if group_id else "user_id"
+        target_id = str(group_id or event.get_sender_id())
+        if not re.fullmatch(r"[0-9]+", target_id):
+            raise ValueError("OneBot 文件发送目标不是有效的 QQ 号或群号")
+
+        # 沿用 AstrBot 的文件服务：配置 callback_api_base 时返回回调 URL，
+        # 否则返回本地绝对路径。协议端必须能够读取路径或访问该 URL。
+        payload = await File(name=pdf_path.name, file=str(pdf_path)).to_dict()
+        file_source = payload.get("data", {}).get("file")
+        if not isinstance(file_source, str) or not file_source:
+            raise ValueError("无法取得 PDF 文件路径或回调地址")
+        params = {target_key: target_id, "file": file_source, "name": pdf_path.name}
+        if self_id := event.get_self_id():
+            params["self_id"] = str(self_id)
+        action = "upload_group_file" if group_id else "upload_private_file"
+        await event.bot.call_action(action, **params)
+
+    def _find_cached_pdf(self, comic_id: str) -> Path | None:
+        plain_path = self.base_mount_dir / f"{comic_id}.pdf"
+        if plain_path.is_file() and plain_path.stat().st_size > 0:
+            return plain_path
+        # 兼容之前直传版使用的“[ID] 标题.pdf”缓存。
+        for path in sorted(self.base_mount_dir.iterdir()):
+            if (
+                path.name.startswith(f"[{comic_id}] ")
+                and path.suffix.lower() == ".pdf"
+                and path.is_file()
+                and path.stat().st_size > 0
+            ):
+                return path
+        return None
+
+    @staticmethod
+    def _image_sort_key(path: Path):
+        return [
+            int(part) if part.isdigit() else part
+            for part in re.split(r"([0-9]+)", path.as_posix())
+        ]
+
+    def _download_pdf(self, comic_id: str) -> Path:
+        option = jmcomic.JmOption.default()
+        pdf_name = f"{comic_id}.pdf"
+        try:
+            album = option.build_jm_client().get_album_detail(comic_id)
+            title = re.sub(r'[<>:"/\\|?*\x00-\x1f]', "_", str(album.title))
+            title = title.strip(" .")[:100].rstrip(" .")
+            if title:
+                pdf_name = f"[{comic_id}] {title}.pdf"
+        except Exception:
+            logger.warning("未能取得漫画标题，将使用 ID 命名：%s", comic_id)
+
+        final_path = self.base_mount_dir / pdf_name
+        with tempfile.TemporaryDirectory(
+            prefix=f"tmp_{comic_id}_", dir=self.base_mount_dir
+        ) as temp_path:
+            work_dir = Path(temp_path)
+            option.dir_rule.base_dir = str(work_dir)
+            jmcomic.download_album(comic_id, option)
+            images = sorted(
+                (
+                    path
+                    for path in work_dir.rglob("*")
+                    if path.is_file()
+                    and path.suffix.lower() in (".webp", ".jpg", ".jpeg", ".png")
+                ),
+                key=self._image_sort_key,
+            )
+            if not images:
+                raise RuntimeError("下载完成，但没有找到图片")
+
+            converted_dir = work_dir / "_converted"
+            converted_dir.mkdir()
+            converted_images = []
+            for index, image_path in enumerate(images):
+                converted_path = converted_dir / f"{index:06d}.jpg"
+                with Image.open(image_path) as image:
+                    with image.convert("RGB") as rgb_image:
+                        rgb_image.save(converted_path, "JPEG", quality=95)
+                converted_images.append(str(converted_path))
+
+            # 先在临时目录完成写入，避免失败时留下被误认为可复用的半成品。
+            pending_path = work_dir / "result.pdf"
+            with pending_path.open("wb") as output:
+                img2pdf.convert(converted_images, outputstream=output)
+            if pending_path.stat().st_size == 0:
+                raise RuntimeError("生成的 PDF 为空")
+            os.replace(pending_path, final_path)
+        return final_path
+
+    @staticmethod
+    def _upload_pdf(pdf_path: Path) -> str:
+        # 只有显式选择“下载链接”时才向第三方服务上传。
+        with pdf_path.open("rb") as pdf_file:
+            response = requests.post(
+                "https://tmpfiles.org/api/v1/upload",
+                files={"file": (pdf_path.name, pdf_file, "application/pdf")},
+                timeout=(10, 120),
+            )
+        response.raise_for_status()
+        payload = response.json()
+        if not isinstance(payload, dict) or payload.get("status") != "success":
+            raise RuntimeError("临时文件服务未返回上传成功结果")
+        data = payload.get("data")
+        raw_url = data.get("url") if isinstance(data, dict) else None
+        if not isinstance(raw_url, str):
+            raise RuntimeError("临时文件服务没有返回下载地址")
+        parts = urlsplit(raw_url)
+        if parts.scheme not in ("http", "https") or parts.netloc != "tmpfiles.org":
+            raise RuntimeError("临时文件服务返回了非预期的地址")
+        if not parts.path.strip("/"):
+            raise RuntimeError("临时文件服务返回了空下载路径")
+        path = parts.path if parts.path.startswith("/dl/") else "/dl" + parts.path
+        return urlunsplit(("https", "tmpfiles.org", path, parts.query, ""))
