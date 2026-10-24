@@ -1,4 +1,5 @@
 import asyncio
+import base64
 import os
 import re
 import tempfile
@@ -70,24 +71,29 @@ class JMComicPDFPlugin(Star):
         target_key = "group_id" if group_id else "user_id"
         target_id = str(group_id or event.get_sender_id())
 
-        # OneBot 协议端把 file 当作 URL/路径识别，含中文、日文、全角符号等
-        # 非 ASCII 字符会报“识别URL失败”，故发送前统一转为 ASCII 安全文件名。
+        # 协议端把 file 当 URL/路径识别，用 ASCII 安全名 + file:// URI。
         send_path, send_name = self._prepare_onebot_file(pdf_path)
-        # 协议端对裸路径报“识别URL失败”，需提供带 scheme 的 file:// URI。
-        file_source = send_path.as_uri()
-        params = {target_key: target_id, "file": file_source, "name": send_name}
         if self_id := event.get_self_id():
-            params["self_id"] = str(self_id)
+            self_id = str(self_id)
+        else:
+            self_id = None
         action = "upload_group_file" if group_id else "upload_private_file"
-        logger.info(
-            "JMCOMIC_DEBUG raw=%s send_path=%s send_name=%s file_field=%s params=%s",
-            pdf_path,
-            send_path,
-            send_name,
-            file_source,
-            params,
-        )
-        await event.bot.call_action(action, **params)
+
+        def build_params(file_field):
+            p = {target_key: target_id, "file": file_field, "name": send_name}
+            if self_id:
+                p["self_id"] = self_id
+            return p
+
+        try:
+            # 优先用 file:// 本地路径（同一文件系统时最快，且可传大文件）。
+            await event.bot.call_action(action, **build_params(send_path.as_uri()))
+        except Exception as exc:
+            logger.warning("file:// 本地路径上传失败(%s)，回退为 base64 上传", exc)
+            # 协议端与 AstrBot 不在同一文件系统（如独立容器）时读不到文件，
+            # 改用 base64 内容直接上传，无需共享磁盘。
+            payload = base64.b64encode(send_path.read_bytes()).decode("ascii")
+            await event.bot.call_action(action, **build_params(f"base64://{payload}"))
 
     def _prepare_onebot_file(self, pdf_path: Path) -> tuple[Path, str]:
         """返回可安全发送给 OneBot 的文件路径与文件名。"""
