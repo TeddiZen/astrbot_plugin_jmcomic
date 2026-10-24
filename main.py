@@ -65,22 +65,46 @@ class JMComicPDFPlugin(Star):
             logger.exception("JMComic 请求处理失败，漫画 ID：%s", comic_id)
             yield event.plain_result("处理失败，请管理员查看 AstrBot 日志。")
 
-    @staticmethod
-    async def _send_onebot_pdf(event: AstrMessageEvent, pdf_path: Path) -> None:
-        # LLoneBot 和 NapCat 共同支持的文件接口，避免依赖普通消息的 file 扩展。
+    async def _send_onebot_pdf(self, event: AstrMessageEvent, pdf_path: Path) -> None:
         group_id = event.get_group_id()
         target_key = "group_id" if group_id else "user_id"
         target_id = str(group_id or event.get_sender_id())
 
-        # 沿用 AstrBot 的文件服务：配置 callback_api_base 时返回回调 URL，
-        # 否则返回本地绝对路径。协议端必须能够读取路径或访问该 URL。
-        payload = await File(name=pdf_path.name, file=str(pdf_path)).to_dict()
+        # OneBot 协议端把 file 当作 URL/路径识别，含中文、日文、全角符号等
+        # 非 ASCII 字符会报“识别URL失败”，故发送前统一转为 ASCII 安全文件名。
+        send_path, send_name = self._prepare_onebot_file(pdf_path)
+        payload = await File(name=send_name, file=str(send_path)).to_dict()
         file_source = payload["data"]["file"]
-        params = {target_key: target_id, "file": file_source, "name": pdf_path.name}
+        params = {target_key: target_id, "file": file_source, "name": send_name}
         if self_id := event.get_self_id():
             params["self_id"] = str(self_id)
         action = "upload_group_file" if group_id else "upload_private_file"
         await event.bot.call_action(action, **params)
+
+    def _prepare_onebot_file(self, pdf_path: Path) -> tuple[Path, str]:
+        """返回可安全发送给 OneBot 的文件路径与文件名。"""
+        safe_name = self._ascii_pdf_name(pdf_path.name)
+        if safe_name == pdf_path.name:
+            return pdf_path, safe_name
+        safe_path = self.base_mount_dir / safe_name
+        if not safe_path.is_file() or safe_path.stat().st_size == 0:
+            import shutil
+            from tempfile import NamedTemporaryFile
+
+            with NamedTemporaryFile(
+                suffix=".pdf", dir=self.base_mount_dir, delete=False
+            ) as tmp:
+                with pdf_path.open("rb") as src:
+                    shutil.copyfileobj(src, tmp)
+                tmp_path = Path(tmp.name)
+            os.replace(tmp_path, safe_path)
+        return safe_path, safe_name
+
+    @staticmethod
+    def _ascii_pdf_name(name: str) -> str:
+        ascii_name = re.sub(r"[^A-Za-z0-9._\s()-]+", "_", name)
+        ascii_name = re.sub(r"[\s]+", " ", ascii_name)
+        return ascii_name.strip(" ._") or f"{int.from_bytes(os.urandom(4), 'big'):08x}.pdf"
 
     def _find_cached_pdf(self, comic_id: str) -> Path | None:
         plain_path = self.base_mount_dir / f"{comic_id}.pdf"
@@ -110,7 +134,7 @@ class JMComicPDFPlugin(Star):
         try:
             album = option.build_jm_client().get_album_detail(comic_id)
             title = re.sub(r'[<>:"/\\|?*\x00-\x1f]', "_", str(album.title))
-            title = title.strip(" .")[:100].rstrip(" .")
+            title = self._ascii_pdf_name(title)[:100]
             if title:
                 pdf_name = f"[{comic_id}] {title}.pdf"
         except Exception:
