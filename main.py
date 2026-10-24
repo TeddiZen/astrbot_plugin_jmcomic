@@ -16,27 +16,22 @@ from astrbot.api.message_components import File
 from astrbot.api.star import Context, Star, register
 
 
-@register("astrbot_plugin_jmcomic", "Air", "下载漫画并发送 PDF 或临时下载链接", "2.2.0")
+@register("astrbot_plugin_jmcomic", "Air", "下载漫画并发送 PDF 或临时下载链接", "2.2.1")
 class JMComicPDFPlugin(Star):
     def __init__(self, context: Context, config: AstrBotConfig):
         super().__init__(context)
         self.config = config
         self.base_mount_dir = Path(__file__).resolve().parents[2] / "jm_tmp"
         self.base_mount_dir.mkdir(parents=True, exist_ok=True)
-        self._download_lock = asyncio.Lock()
 
     @filter.command("jm")
     async def fetch_comic(self, event: AstrMessageEvent, comic_id: str = ""):
         """下载指定 ID 的漫画，按插件配置发送 PDF 或下载链接。"""
-        event.stop_event()
         if event.get_group_id() and not self.config.get("allow_group", False):
             yield event.plain_result("当前未开放群聊使用，请私聊机器人。")
             return
 
         access_mode = self.config.get("access_mode", "仅管理员")
-        if access_mode not in ("仅管理员", "所有人"):
-            yield event.plain_result("使用权限配置无效，请管理员检查插件配置。")
-            return
         if access_mode == "仅管理员" and not event.is_admin():
             yield event.plain_result("当前仅允许 AstrBot 管理员使用此指令。")
             return
@@ -46,38 +41,29 @@ class JMComicPDFPlugin(Star):
             return
 
         delivery_mode = self.config.get("delivery_mode", "下载链接")
-        if delivery_mode not in ("下载链接", "直接发送 PDF"):
-            yield event.plain_result("发送方式配置无效，请管理员检查插件配置。")
-            return
+        try:
+            pdf_path = self._find_cached_pdf(comic_id)
+            if pdf_path is None:
+                yield event.plain_result(f"正在下载 {comic_id} 并生成 PDF，请稍候。")
+                pdf_path = await asyncio.to_thread(self._download_pdf, comic_id)
+            else:
+                yield event.plain_result("找到已生成的 PDF，正在发送。")
 
-        if self._download_lock.locked():
-            yield event.plain_result("当前正在处理其他请求，请稍后重试。")
-            return
-
-        async with self._download_lock:
-            try:
-                pdf_path = self._find_cached_pdf(comic_id)
-                if pdf_path is None:
-                    yield event.plain_result(f"正在下载 {comic_id} 并生成 PDF，请稍候。")
-                    pdf_path = await asyncio.to_thread(self._download_pdf, comic_id)
+            if delivery_mode == "直接发送 PDF":
+                if event.get_platform_name() == "aiocqhttp":
+                    await self._send_onebot_pdf(event, pdf_path)
+                    yield event.plain_result("PDF 已发送。")
                 else:
-                    yield event.plain_result("找到已生成的 PDF，正在发送。")
-
-                if delivery_mode == "直接发送 PDF":
-                    if event.get_platform_name() == "aiocqhttp":
-                        await self._send_onebot_pdf(event, pdf_path)
-                        yield event.plain_result("PDF 已发送。")
-                    else:
-                        yield event.chain_result(
-                            [File(name=pdf_path.name, file=str(pdf_path))]
-                        )
-                else:
-                    yield event.plain_result("正在上传 PDF 并获取临时下载链接。")
-                    download_url = await asyncio.to_thread(self._upload_pdf, pdf_path)
-                    yield event.plain_result(f"下载地址：\n{download_url}")
-            except Exception:
-                logger.exception("JMComic 请求处理失败，漫画 ID：%s", comic_id)
-                yield event.plain_result("处理失败，请管理员查看 AstrBot 日志。")
+                    yield event.chain_result(
+                        [File(name=pdf_path.name, file=str(pdf_path))]
+                    )
+            else:
+                yield event.plain_result("正在上传 PDF 并获取临时下载链接。")
+                download_url = await asyncio.to_thread(self._upload_pdf, pdf_path)
+                yield event.plain_result(f"下载地址：\n{download_url}")
+        except Exception:
+            logger.exception("JMComic 请求处理失败，漫画 ID：%s", comic_id)
+            yield event.plain_result("处理失败，请管理员查看 AstrBot 日志。")
 
     @staticmethod
     async def _send_onebot_pdf(event: AstrMessageEvent, pdf_path: Path) -> None:
@@ -85,15 +71,11 @@ class JMComicPDFPlugin(Star):
         group_id = event.get_group_id()
         target_key = "group_id" if group_id else "user_id"
         target_id = str(group_id or event.get_sender_id())
-        if not re.fullmatch(r"[0-9]+", target_id):
-            raise ValueError("OneBot 文件发送目标不是有效的 QQ 号或群号")
 
         # 沿用 AstrBot 的文件服务：配置 callback_api_base 时返回回调 URL，
         # 否则返回本地绝对路径。协议端必须能够读取路径或访问该 URL。
         payload = await File(name=pdf_path.name, file=str(pdf_path)).to_dict()
-        file_source = payload.get("data", {}).get("file")
-        if not isinstance(file_source, str) or not file_source:
-            raise ValueError("无法取得 PDF 文件路径或回调地址")
+        file_source = payload["data"]["file"]
         params = {target_key: target_id, "file": file_source, "name": pdf_path.name}
         if self_id := event.get_self_id():
             params["self_id"] = str(self_id)

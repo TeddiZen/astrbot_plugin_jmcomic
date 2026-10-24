@@ -10,14 +10,13 @@
     "type": "string",
     "default": "仅管理员",
     "options": ["仅管理员", "所有人"],
-    "hint": "管理员指 AstrBot 后台配置的全局管理员，群主或群管理员不会自动获得权限。所有人仍须满足 AstrBot 自身的访问控制规则。"
+    "hint": "管理员指 AstrBot 后台设置的全局管理员。"
   },
   "delivery_mode": {
     "description": "发送方式",
     "type": "string",
     "default": "下载链接",
     "options": ["下载链接", "直接发送 PDF"],
-    "hint": "下载链接：上传 PDF 到 tmpfiles.org 后返回临时地址。直接发送 PDF：OneBot v11 使用私聊或群聊文件上传接口；协议端须能读取本地路径，或访问 AstrBot 配置的文件回调 URL。PDF 会保留在 data/jm_tmp 中供后续复用。",
-    "obvious_hint": true
+    "hint": "下载链接会上传到 tmpfiles.org；直接发送 PDF 由当前协议端发送本地文件。"
   }
 }
