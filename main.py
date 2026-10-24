@@ -3,7 +3,7 @@ import os
 import re
 import tempfile
 from pathlib import Path
-from urllib.parse import urlsplit, urlunsplit
+from urllib.parse import quote, urlsplit, urlunsplit
 
 import img2pdf
 import jmcomic
@@ -75,6 +75,10 @@ class JMComicPDFPlugin(Star):
         send_path, send_name = self._prepare_onebot_file(pdf_path)
         payload = await File(name=send_name, file=str(send_path)).to_dict()
         file_source = payload["data"]["file"]
+        # OneBot v11 要求 file 字段为 URL 编码后的路径（或 file:// 链接），
+        # 中文、空格、括号等未编码会导致“识别URL失败”，故本地路径一律转义。
+        if not file_source.lower().startswith(("http://", "https://")):
+            file_source = quote(file_source, safe="/")
         params = {target_key: target_id, "file": file_source, "name": send_name}
         if self_id := event.get_self_id():
             params["self_id"] = str(self_id)
