@@ -65,33 +65,33 @@ class JMComicPDFPlugin(Star):
             logger.exception("JMComic 请求处理失败，漫画 ID：%s", comic_id)
             yield event.plain_result("处理失败，请管理员查看 AstrBot 日志。")
 
-        async def _send_onebot_pdf(self, event: AstrMessageEvent, pdf_path: Path) -> None:
-            group_id = event.get_group_id()
-            target_key = "group_id" if group_id else "user_id"
-            target_id = str(group_id or event.get_sender_id())
+    async def _send_onebot_pdf(self, event: AstrMessageEvent, pdf_path: Path) -> None:
+        group_id = event.get_group_id()
+        target_key = "group_id" if group_id else "user_id"
+        target_id = str(group_id or event.get_sender_id())
 
-            # OneBot 协议端把 file 当作 URL/路径识别，含中文、日文、全角符号等
-            # 非 ASCII 字符会报“识别URL失败”，故发送前统一转为 ASCII 安全文件名。
-            send_path, send_name = self._prepare_onebot_file(pdf_path)
-            payload = await File(name=send_name, file=str(send_path)).to_dict()
-            file_source = payload["data"]["file"]
-            # OneBot v11 要求 file 字段为 URL 编码后的路径（或 file:// 链接），
-            # 中文、空格、括号等未编码会导致“识别URL失败”，故本地路径一律转义。
-            if not file_source.lower().startswith(("http://", "https://")):
-                file_source = quote(file_source, safe="/")
-            params = {target_key: target_id, "file": file_source, "name": send_name}
-            if self_id := event.get_self_id():
-                params["self_id"] = str(self_id)
-            action = "upload_group_file" if group_id else "upload_private_file"
-            logger.info(
-                "JMCOMIC_DEBUG raw=%s send_path=%s send_name=%s file_field=%s params=%s",
-                pdf_path,
-                send_path,
-                send_name,
-                file_source,
-                params,
-            )
-            await event.bot.call_action(action, **params)
+        # OneBot 协议端把 file 当作 URL/路径识别，含中文、日文、全角符号等
+        # 非 ASCII 字符会报“识别URL失败”，故发送前统一转为 ASCII 安全文件名。
+        send_path, send_name = self._prepare_onebot_file(pdf_path)
+        payload = await File(name=send_name, file=str(send_path)).to_dict()
+        file_source = payload["data"]["file"]
+        # OneBot v11 要求 file 字段为 URL 编码后的路径（或 file:// 链接），
+        # 中文、空格、括号等未编码会导致“识别URL失败”，故本地路径一律转义。
+        if not file_source.lower().startswith(("http://", "https://")):
+            file_source = quote(file_source, safe="/")
+        params = {target_key: target_id, "file": file_source, "name": send_name}
+        if self_id := event.get_self_id():
+            params["self_id"] = str(self_id)
+        action = "upload_group_file" if group_id else "upload_private_file"
+        logger.info(
+            "JMCOMIC_DEBUG raw=%s send_path=%s send_name=%s file_field=%s params=%s",
+            pdf_path,
+            send_path,
+            send_name,
+            file_source,
+            params,
+        )
+        await event.bot.call_action(action, **params)
 
     def _prepare_onebot_file(self, pdf_path: Path) -> tuple[Path, str]:
         """返回可安全发送给 OneBot 的文件路径与文件名。"""
