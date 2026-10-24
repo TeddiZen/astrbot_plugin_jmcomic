@@ -75,10 +75,8 @@ class JMComicPDFPlugin(Star):
         send_path, send_name = self._prepare_onebot_file(pdf_path)
         payload = await File(name=send_name, file=str(send_path)).to_dict()
         file_source = payload["data"]["file"]
-        # OneBot v11 要求 file 字段为 URL 编码后的路径（或 file:// 链接），
-        # 中文、空格、括号等未编码会导致“识别URL失败”，故本地路径一律转义。
-        if not file_source.lower().startswith(("http://", "https://")):
-            file_source = quote(file_source, safe="/")
+        # 协议端只接受纯 ASCII 且无空格的本地路径，百分号编码（%20 等）与
+        # 空格、括号都会导致“识别URL失败”，故文件名一律收紧并直接传原始路径。
         params = {target_key: target_id, "file": file_source, "name": send_name}
         if self_id := event.get_self_id():
             params["self_id"] = str(self_id)
@@ -114,9 +112,11 @@ class JMComicPDFPlugin(Star):
 
     @staticmethod
     def _ascii_pdf_name(name: str) -> str:
-        ascii_name = re.sub(r"[^A-Za-z0-9._\s()-]+", "_", name)
-        ascii_name = re.sub(r"[\s]+", " ", ascii_name)
-        return ascii_name.strip(" ._") or f"{int.from_bytes(os.urandom(4), 'big'):08x}.pdf"
+        # 只保留字母数字、下划线、连字符，空格括号等一律替换为下划线，
+        # 保证生成的文件名不含任何特殊字符，OneBot 可直接识别。
+        ascii_name = re.sub(r"[^A-Za-z0-9_-]+", "_", name)
+        ascii_name = re.sub(r"_+", "_", ascii_name)
+        return ascii_name.strip("_") or f"{int.from_bytes(os.urandom(4), 'big'):08x}"
 
     def _find_cached_pdf(self, comic_id: str) -> Path | None:
         plain_path = self.base_mount_dir / f"{comic_id}.pdf"
