@@ -73,10 +73,8 @@ class JMComicPDFPlugin(Star):
         # OneBot 协议端把 file 当作 URL/路径识别，含中文、日文、全角符号等
         # 非 ASCII 字符会报“识别URL失败”，故发送前统一转为 ASCII 安全文件名。
         send_path, send_name = self._prepare_onebot_file(pdf_path)
-        payload = await File(name=send_name, file=str(send_path)).to_dict()
-        file_source = payload["data"]["file"]
-        # 协议端只接受纯 ASCII 且无空格的本地路径，百分号编码（%20 等）与
-        # 空格、括号都会导致“识别URL失败”，故文件名一律收紧并直接传原始路径。
+        # 协议端对裸路径报“识别URL失败”，需提供带 scheme 的 file:// URI。
+        file_source = send_path.as_uri()
         params = {target_key: target_id, "file": file_source, "name": send_name}
         if self_id := event.get_self_id():
             params["self_id"] = str(self_id)
@@ -112,11 +110,11 @@ class JMComicPDFPlugin(Star):
 
     @staticmethod
     def _ascii_pdf_name(name: str) -> str:
-        # 只保留字母数字、下划线、连字符，空格括号等一律替换为下划线，
-        # 保证生成的文件名不含任何特殊字符，OneBot 可直接识别。
-        ascii_name = re.sub(r"[^A-Za-z0-9_-]+", "_", name)
-        ascii_name = re.sub(r"_+", "_", ascii_name)
-        return ascii_name.strip("_") or f"{int.from_bytes(os.urandom(4), 'big'):08x}"
+        # 保留 .pdf 扩展名，其余字符只留字母数字、下划线、连字符。
+        stem, ext = os.path.splitext(name)
+        ascii_stem = re.sub(r"[^A-Za-z0-9_-]+", "_", stem)
+        ascii_stem = re.sub(r"_+", "_", ascii_stem).strip("_") or "comic"
+        return ascii_stem + (ext if ext.lower() == ".pdf" else ".pdf")
 
     def _find_cached_pdf(self, comic_id: str) -> Path | None:
         plain_path = self.base_mount_dir / f"{comic_id}.pdf"
@@ -145,8 +143,8 @@ class JMComicPDFPlugin(Star):
         pdf_name = f"{comic_id}.pdf"
         try:
             album = option.build_jm_client().get_album_detail(comic_id)
-            title = re.sub(r'[<>:"/\\|?*\x00-\x1f]', "_", str(album.title))
-            title = self._ascii_pdf_name(title)[:100]
+            title = re.sub(r"[^A-Za-z0-9_-]+", "_", str(album.title))
+            title = re.sub(r"_+", "_", title).strip("_- ")[:100]
             if title:
                 pdf_name = f"[{comic_id}] {title}.pdf"
         except Exception:
